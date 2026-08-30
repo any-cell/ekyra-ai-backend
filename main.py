@@ -29,11 +29,11 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 # ── TIER SYSTEM (question-based credits) ─────────────────────
 TIERS = {
-    "free":     {"limit": 20,    "label": "Free",     "price": 0},
-    "starter":  {"limit": 100,   "label": "Starter",  "price": 199},
-    "pro":      {"limit": 1000,  "label": "Pro",      "price": 799},
-    "ultra":    {"limit": 1000,  "label": "Ultra",    "price": 1299},
-    "ultimate": {"limit": 1000,  "label": "Ultimate", "price": 1499},
+    "free":     {"limit": 400,    "label": "Free",     "price": 0},
+    "starter":  {"limit": 700,    "label": "Starter",  "price": 199},
+    "pro":      {"limit": 9000,   "label": "Pro",      "price": 799},
+    "ultra":    {"limit": 20000,  "label": "Ultra",    "price": 1299},
+    "ultimate": {"limit": 999999, "label": "Ultimate", "price": 1499},
 }
 
 # Each action costs 1 credit (1 question = 1 credit)
