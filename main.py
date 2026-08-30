@@ -8,6 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import httpx
+import urllib.request
+import urllib.parse
+from lxml import html
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,19 +27,20 @@ app.add_middleware(
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# ── TIER SYSTEM ──────────────────────────────────────────────
+# ── TIER SYSTEM (question-based credits) ─────────────────────
 TIERS = {
-    "free":     {"limit": 1000,  "label": "Free"},
-    "starter":  {"limit": 5000,  "label": "Starter"},
-    "pro":      {"limit": 10000, "label": "Pro"},
-    "ultimate": {"limit": 10000, "label": "Ultimate"},
+    "free":     {"limit": 20,    "label": "Free",     "price": 0},
+    "starter":  {"limit": 100,   "label": "Starter",  "price": 199},
+    "pro":      {"limit": 1000,  "label": "Pro",      "price": 799},
+    "ultra":    {"limit": 1000,  "label": "Ultra",    "price": 1299},
+    "ultimate": {"limit": 1000,  "label": "Ultimate", "price": 1499},
 }
 
-# Token costs per action (designed so free users get ~20 chats or ~10 images)
+# Each action costs 1 credit (1 question = 1 credit)
 TOKEN_COSTS = {
-    "chat":    50,   # ~20 chats on free tier
-    "analyze": 75,   # ~13 file analyses on free tier
-    "image":   100,  # ~10 images on free tier
+    "chat":    1,
+    "analyze": 1,
+    "image":   1,
 }
 
 # ── TOKEN MANAGER (JSON file storage) ────────────────────────
@@ -146,10 +150,10 @@ ACTIVE_MODELS = [
     },
     {
         "id": "Grok",
-        "name": "Grok 4.3",
+        "name": "Grok 4.6",
         "desc": "Real-time news from X",
         "theme": "grok",
-        "api_model": "x-ai/grok-4.3"
+        "api_model": "x-ai/grok-4.6"
     }
 ]
 
@@ -173,6 +177,27 @@ class ImageGenRequest(BaseModel):
     model: Optional[str] = "GPT Image 2.0"
     user_id: str
 
+class UpgradeRequest(BaseModel):
+    user_id: str
+    plan: str
+    amount: int
+    utr: str
+
+
+# ── UPGRADE REQUESTS STORAGE ─────────────────────────────────
+UPGRADE_FILE = Path("upgrade_requests.json")
+
+def _load_upgrades() -> list:
+    if UPGRADE_FILE.exists():
+        try:
+            return json.loads(UPGRADE_FILE.read_text())
+        except Exception:
+            return []
+    return []
+
+def _save_upgrades(data: list):
+    UPGRADE_FILE.write_text(json.dumps(data, indent=2))
+
 
 # ── HEALTH & INFO ENDPOINTS ──────────────────────────────────
 @app.get("/")
@@ -189,6 +214,62 @@ def get_models():
 def get_quota(user_id: str):
     """Returns the user's current quota status"""
     return get_user_quota(user_id)
+
+
+# ── UPGRADE REQUEST ENDPOINT ─────────────────────────────────
+@app.post("/upgrade-request")
+def submit_upgrade_request(req: UpgradeRequest):
+    """Stores a pending upgrade request (manual UPI verification)"""
+    valid_plans = ["starter", "pro", "ultra", "ultimate"]
+    if req.plan not in valid_plans:
+        raise HTTPException(status_code=400, detail=f"Invalid plan. Choose from: {valid_plans}")
+    
+    expected_price = TIERS[req.plan]["price"]
+    if req.amount != expected_price:
+        raise HTTPException(status_code=400, detail=f"Amount mismatch. Expected {expected_price} for {req.plan} plan.")
+    
+    upgrades = _load_upgrades()
+    upgrades.append({
+        "user_id": req.user_id,
+        "plan": req.plan,
+        "amount": req.amount,
+        "utr": req.utr,
+        "status": "pending",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+    })
+    _save_upgrades(upgrades)
+    return {"status": "ok", "message": f"Upgrade request for {req.plan} plan submitted successfully."}
+
+
+@app.get("/upgrade-requests")
+def list_upgrade_requests():
+    """Admin endpoint to view all pending upgrade requests"""
+    return {"requests": _load_upgrades()}
+
+
+@app.post("/approve-upgrade/{user_id}/{plan}")
+def approve_upgrade(user_id: str, plan: str):
+    """Admin endpoint to approve an upgrade and change user tier"""
+    if plan not in TIERS:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    
+    data = _load_quota()
+    if user_id not in data:
+        data[user_id] = {"tier": plan, "date": _today(), "used": 0}
+    else:
+        data[user_id]["tier"] = plan
+    _save_quota(data)
+    
+    # Mark request as approved
+    upgrades = _load_upgrades()
+    for u in upgrades:
+        if u["user_id"] == user_id and u["plan"] == plan and u["status"] == "pending":
+            u["status"] = "approved"
+            u["approved_at"] = datetime.now(timezone.utc).isoformat()
+            break
+    _save_upgrades(upgrades)
+    
+    return {"status": "ok", "message": f"User {user_id} upgraded to {plan}", "quota": get_user_quota(user_id)}
 
 
 # ── SMART ROUTER ─────────────────────────────────────────────
@@ -236,6 +317,25 @@ async def route_prompt(prompt: str, api_key: str) -> str:
         return "ChatGPT"
 
 
+# ── WEB SEARCH TOOL ──────────────────────────────────────────
+def perform_web_search(query: str) -> str:
+    try:
+        req = urllib.request.Request(
+            'https://lite.duckduckgo.com/lite/',
+            data=urllib.parse.urlencode({'q': query}).encode('utf-8'),
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        )
+        res = urllib.request.urlopen(req).read()
+        tree = html.fromstring(res)
+        snippets = []
+        for snippet in tree.xpath("//td[@class='result-snippet']")[:5]:
+            snippets.append(snippet.text_content().strip())
+        if not snippets:
+            return "No search results found."
+        return "Search Results:\n" + "\n".join(f"- {s}" for s in snippets)
+    except Exception as e:
+        return f"Search failed: {str(e)}"
+
 # ── CHAT ENDPOINT ────────────────────────────────────────────
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -261,7 +361,16 @@ async def chat(req: ChatRequest):
     messages = []
     messages.append({
         "role": "system",
-        "content": "You are Ekyra AI, a highly intelligent and professional AI assistant. Provide helpful, concise, and accurate answers. Format your output using markdown."
+        "content": (
+            "You are Ekyra AI, a highly intelligent and professional AI assistant. "
+            "You have access to these tools:\n"
+            "1. web_search — Use this if the user asks about recent news, current events, or facts outside your training data.\n"
+            "2. generate_image — Use this if the user asks you to generate, create, draw, make, or show them ANY image, picture, photo, illustration, or diagram on ANY topic. "
+            "Extract the best possible image prompt from their request and call the tool.\n\n"
+            "IMPORTANT: Always remember the full conversation context. If you are switched to a different AI model mid-conversation, "
+            "read the entire chat history first and continue naturally from where the conversation left off.\n"
+            "Provide helpful, concise, and accurate answers. Format your output using markdown."
+        )
     })
     
     for msg in req.history:
@@ -277,13 +386,51 @@ async def chat(req: ChatRequest):
         "Content-Type": "application/json"
     }
 
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the live internet for up-to-date information, news, current events, or facts you do not know.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query to look up on DuckDuckGo"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_image",
+                "description": "Generate an image based on a text description. Use this when the user asks to generate, create, draw, make, or show any image, picture, photo, illustration, or diagram.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "A detailed description of the image to generate. Be specific and descriptive."
+                        }
+                    },
+                    "required": ["prompt"]
+                }
+            }
+        }
+    ]
+
     payload = {
         "model": actual_model,
-        "messages": messages
+        "messages": messages,
+        "tools": tools
     }
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=90.0) as client:
             response = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
@@ -292,7 +439,82 @@ async def chat(req: ChatRequest):
             response.raise_for_status()
             data = response.json()
             
-            ai_text = data["choices"][0]["message"]["content"]
+            message_obj = data["choices"][0]["message"]
+            
+            # Check if model wants to call a tool
+            if "tool_calls" in message_obj and message_obj["tool_calls"]:
+                tool_call = message_obj["tool_calls"][0]
+                tool_name = tool_call["function"]["name"]
+                args = json.loads(tool_call["function"]["arguments"])
+                
+                if tool_name == "web_search":
+                    search_results = perform_web_search(args["query"])
+                    
+                    messages.append(message_obj)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": search_results
+                    })
+                    
+                    payload["messages"] = messages
+                    payload.pop("tools", None)
+                    
+                    res2 = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers=headers,
+                        json=payload
+                    )
+                    res2.raise_for_status()
+                    data2 = res2.json()
+                    ai_text = data2["choices"][0]["message"]["content"]
+                    
+                    return {
+                        "response": ai_text,
+                        "model_used": display_key,
+                        "reason": f"Searched web for: {args['query']}",
+                        "quota": get_user_quota(req.user_id),
+                    }
+                
+                elif tool_name == "generate_image":
+                    import urllib.parse
+                    image_prompt = args.get("prompt", req.message)
+                    safe_prompt = urllib.parse.quote(image_prompt)
+                    image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?nologo=true&enhance=true"
+                    
+                    # Tell the AI the image was generated, let it write a nice response
+                    messages.append(message_obj)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": f"Image generated successfully. The image URL is: {image_url}"
+                    })
+                    
+                    payload["messages"] = messages
+                    payload.pop("tools", None)
+                    
+                    res2 = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers=headers,
+                        json=payload
+                    )
+                    res2.raise_for_status()
+                    data2 = res2.json()
+                    ai_text = data2["choices"][0]["message"]["content"] or ""
+                    
+                    # Make sure the image URL is in the response
+                    if image_url not in ai_text:
+                        ai_text += f"\n\n![Generated Image]({image_url})"
+                    
+                    return {
+                        "response": ai_text,
+                        "model_used": display_key,
+                        "reason": f"Generated image: {image_prompt[:50]}",
+                        "image_url": image_url,
+                        "quota": get_user_quota(req.user_id),
+                    }
+            
+            ai_text = message_obj.get("content", "")
             quota = get_user_quota(req.user_id)
             
             return {
@@ -378,59 +600,57 @@ async def analyze_file(
 # ── IMAGE GENERATION ENDPOINT ────────────────────────────────
 @app.post("/image")
 async def generate_image(req: ImageGenRequest):
-    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "your_openrouter_api_key_here":
-        raise HTTPException(status_code=500, detail="API Key not configured on the backend.")
-
+    import urllib.parse, os, base64
+    
     # ── CHECK QUOTA ──
     token_result = consume_tokens(req.user_id, "image")
     if "error" in token_result:
         return token_result
 
-    # Use OpenRouter to call image generation models
-    # GPT Image 2.0 → openai/gpt-image-1 (latest available on OpenRouter)
-    # DALL-E 3 → openai/dall-e-3
-    if "dall-e" in (req.model or "").lower():
-        img_model = "openai/dall-e-3"
-        source = "DALL-E 3"
-    else:
-        img_model = "openai/gpt-image-1"
-        source = "GPT Image"
+    safe_prompt = urllib.parse.quote(req.prompt)
+    model_requested = (req.model or "").lower()
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "HTTP-Referer": "https://ekyra.app",
-        "X-Title": "Ekyra AI",
-        "Content-Type": "application/json",
+    # ── Try OpenAI image models if key is available ──
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if openai_key and ("dall" in model_requested or "gpt image" in model_requested or model_requested == ""):
+        # Pick the actual model: DALL-E 3 or GPT Image 2.0 (gpt-image-1)
+        if "gpt image" in model_requested or "gpt-image" in model_requested:
+            api_model = "gpt-image-1"
+            source_label = "GPT Image 2.0"
+        else:
+            api_model = "dall-e-3"
+            source_label = "DALL-E 3"
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/images/generations",
+                    headers={
+                        "Authorization": f"Bearer {openai_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": api_model,
+                        "prompt": req.prompt,
+                        "n": 1,
+                        "size": "1024x1024",
+                        "quality": "standard",
+                        "response_format": "url",
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    image_url = data["data"][0].get("url") or data["data"][0].get("b64_json")
+                    if image_url and image_url.startswith("http"):
+                        return {"image_url": image_url, "source": source_label}
+                    elif image_url:
+                        return {"image_url": f"data:image/png;base64,{image_url}", "source": source_label}
+        except Exception as e:
+            print(f"{source_label} error, falling back to Pollinations: {e}")
+
+    # ── Fallback: Pollinations.ai (free, no key needed) ──
+    image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?model=flux&nologo=true&enhance=true&width=1024&height=1024"
+    return {
+        "image_url": image_url,
+        "source": "Pollinations AI (Flux)"
     }
-
-    payload = {
-        "model": img_model,
-        "prompt": req.prompt,
-        "n": 1,
-        "size": "1024x1024",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            response = await client.post(
-                "https://openrouter.ai/api/v1/images/generations",
-                headers=headers,
-                json=payload
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            image_url = data["data"][0].get("url") or data["data"][0].get("b64_json", "")
-            quota = get_user_quota(req.user_id)
-            
-            return {
-                "image_url": image_url,
-                "source": source,
-                "quota": quota,
-            }
-    except httpx.HTTPStatusError as e:
-        print(f"Image gen HTTP error: {e.response.status_code} - {e.response.text}")
-        raise HTTPException(status_code=500, detail="Image generation failed. The model may not be available.")
-    except Exception as e:
-        print(f"Image gen error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to generate image.")
