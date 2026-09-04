@@ -46,7 +46,10 @@ MODEL_MAP = {
 }
 
 app = FastAPI(title="Ekyra AI Backend")
-
+@app.get("/")
+async def keep_awake():
+    """Health check endpoint for cron jobs to ping"""
+    return {"status": "awake", "message": "Ekyra AI Backend is running!"}
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
