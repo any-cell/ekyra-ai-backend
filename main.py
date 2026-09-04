@@ -1,21 +1,51 @@
-import os
-import json
 import base64
+import io
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    import docx
+except ImportError:
+    docx = None
+
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
 import httpx
-import urllib.request
-import urllib.parse
-from lxml import html
+import os
+import json
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load environment variables
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
 
-app = FastAPI(title="Ekyra AI Backend API")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
+# We keep a mapping of common names to OpenRouter models
+# Add more models to this dictionary to support them in the app.
+MODEL_MAP = {
+    "Auto ✨": "openai/chatgpt-4o-latest",
+    "ChatGPT": "openai/chatgpt-4o-latest",
+    "Claude": "anthropic/claude-3.5-sonnet",
+    "Gemini": "google/gemini-flash-1.5",
+    "Grok": "x-ai/grok-2",
+    "Claude Sonnet 3.5": "anthropic/claude-3.5-sonnet",
+    "ChatGPT 5.6 Luna": "openai/gpt-4o-mini",
+    "Gemini 3.7 Flash": "google/gemini-flash-1.5",
+    "Grok 4.6": "x-ai/grok-2",
+    "Claude Opus 5": "anthropic/claude-3-opus",
+    "GPT 5.6 Sol": "openai/chatgpt-4o-latest",
+    "Gemini 3.1 Pro": "google/gemini-pro-1.5",
+    "Grok 4.6 (Premium)": "x-ai/grok-2"
+}
+
+app = FastAPI(title="Ekyra AI Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,318 +55,132 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-# ── TIER SYSTEM (question-based credits) ─────────────────────
-TIERS = {
-    "free":     {"limit": 400,    "label": "Free",     "price": 0},
-    "starter":  {"limit": 700,    "label": "Starter",  "price": 199},
-    "pro":      {"limit": 9000,   "label": "Pro",      "price": 799},
-    "ultra":    {"limit": 20000,  "label": "Ultra",    "price": 1299},
-    "ultimate": {"limit": 999999, "label": "Ultimate", "price": 1499},
-}
-
-# Each action costs 1 credit (1 question = 1 credit)
-TOKEN_COSTS = {
-    "chat":    1,
-    "analyze": 1,
-    "image":   1,
-}
-
-# ── TOKEN MANAGER (JSON file storage) ────────────────────────
-QUOTA_FILE = Path("quota_data.json")
-
-def _load_quota() -> dict:
-    if QUOTA_FILE.exists():
-        try:
-            return json.loads(QUOTA_FILE.read_text())
-        except Exception:
-            return {}
-    return {}
-
-def _save_quota(data: dict):
-    QUOTA_FILE.write_text(json.dumps(data, indent=2))
-
-def _today() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-def get_user_quota(user_id: str) -> dict:
-    """Get or create a user's quota record. Resets daily."""
-    data = _load_quota()
-    today = _today()
-    
-    if user_id not in data:
-        data[user_id] = {"tier": "free", "date": today, "used": 0}
-        _save_quota(data)
-    
-    user = data[user_id]
-    
-    # Daily reset: if the date is different, reset usage
-    if user.get("date") != today:
-        user["used"] = 0
-        user["date"] = today
-        _save_quota(data)
-    
-    tier = user.get("tier", "free")
-    limit = TIERS.get(tier, TIERS["free"])["limit"]
-    remaining = max(0, limit - user.get("used", 0))
-    
-    return {
-        "user_id": user_id,
-        "tier": tier,
-        "tier_label": TIERS.get(tier, TIERS["free"])["label"],
-        "limit": limit,
-        "used": user.get("used", 0),
-        "remaining": remaining,
-    }
-
-def consume_tokens(user_id: str, action: str) -> dict:
-    """Consume tokens for an action. Returns quota info or raises if exceeded."""
-    cost = TOKEN_COSTS.get(action, 50)
-    quota = get_user_quota(user_id)
-    
-    if quota["remaining"] < cost:
-        tier = quota["tier"]
-        if tier == "free":
-            return {
-                "error": "quota_exceeded",
-                "message": "You've used all your free messages for today! 🐙 Upgrade to Starter or Pro for more. See you tomorrow!",
-                "quota": quota,
-            }
-        else:
-            return {
-                "error": "quota_exceeded",
-                "message": f"Daily limit reached for your {quota['tier_label']} plan. Your quota resets tomorrow at midnight UTC!",
-                "quota": quota,
-            }
-    
-    # Deduct tokens
-    data = _load_quota()
-    data[user_id]["used"] = data[user_id].get("used", 0) + cost
-    _save_quota(data)
-    
-    return {"ok": True, "quota": get_user_quota(user_id)}
-
-
-# ── AI MODEL CONFIG ──────────────────────────────────────────
-ACTIVE_MODELS = [
-    {
-        "id": "Auto",
-        "name": "Auto ✨",
-        "desc": "Picks best AI for you",
-        "theme": "auto",
-        "api_model": "openai/gpt-4o"
-    },
-    {
-        "id": "Gemini",
-        "name": "Gemini 3.1 Pro",
-        "desc": "Emails & Google Services",
-        "theme": "gemini",
-        "api_model": "google/gemini-3.1-pro-preview"
-    },
-    {
-        "id": "Claude",
-        "name": "Claude Sonnet 5",
-        "desc": "Coding, Essays & Reading",
-        "theme": "claude",
-        "api_model": "anthropic/claude-sonnet-5"
-    },
-    {
-        "id": "ChatGPT",
-        "name": "GPT-4o",
-        "desc": "Quick basics & small tasks",
-        "theme": "gpt",
-        "api_model": "openai/gpt-4o"
-    },
-    {
-        "id": "Grok",
-        "name": "Grok 4.6",
-        "desc": "Real-time news from X",
-        "theme": "grok",
-        "api_model": "x-ai/grok-4.6"
-    }
-]
-
-MODEL_MAP = { m["id"]: m["api_model"] for m in ACTIVE_MODELS }
-
-
-# ── REQUEST MODELS ───────────────────────────────────────────
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-    isFileMessage: Optional[bool] = False
-
 class ChatRequest(BaseModel):
     message: str
-    history: List[ChatMessage]
-    model: str
+    history: list = []
+    model: str = "Auto ✨"
     user_id: str
 
 class ImageGenRequest(BaseModel):
     prompt: str
-    model: Optional[str] = "GPT Image 2.0"
+    model: str = ""
     user_id: str
 
-class UpgradeRequest(BaseModel):
-    user_id: str
-    plan: str
-    amount: int
-    utr: str
+# ── QUOTA MANAGEMENT ─────────────────────────────────────────
 
+QUOTA_FILE = Path(__file__).parent / "quota_data.json"
 
-# ── UPGRADE REQUESTS STORAGE ─────────────────────────────────
-UPGRADE_FILE = Path("upgrade_requests.json")
-
-def _load_upgrades() -> list:
-    if UPGRADE_FILE.exists():
+def load_quotas():
+    if QUOTA_FILE.exists():
         try:
-            return json.loads(UPGRADE_FILE.read_text())
-        except Exception:
-            return []
-    return []
+            with open(QUOTA_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
 
-def _save_upgrades(data: list):
-    UPGRADE_FILE.write_text(json.dumps(data, indent=2))
+def save_quotas(data):
+    with open(QUOTA_FILE, "w") as f:
+        json.dump(data, f)
 
+# Tiers configuration (aligns with Flutter app)
+TIERS = {
+    "Free": {"limit": 400},
+    "Pro": {"limit": 1000},
+    "Ultra": {"limit": 3000},
+    "Ultimate": {"limit": 999999}
+}
 
-# ── HEALTH & INFO ENDPOINTS ──────────────────────────────────
-@app.get("/")
-@app.get("/health")
-def health_check():
-    return {"status": "online"}
+TOKEN_COSTS = {
+    "chat": 20,
+    "analyze": 20,
+    "image": 40
+}
 
-@app.get("/models")
-def get_models():
-    """Returns the list of active models for the frontend to render"""
-    return {"models": ACTIVE_MODELS}
+def get_user_quota(user_id: str):
+    data = load_quotas()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
+    if user_id not in data:
+        data[user_id] = {
+            "tier": "Free",
+            "date": today,
+            "used": 0
+        }
+    
+    user_data = data[user_id]
+    
+    if user_data.get("date") != today:
+        user_data["date"] = today
+        user_data["used"] = 0
+        
+    save_quotas(data)
+    
+    limit = TIERS.get(user_data["tier"], TIERS["Free"])["limit"]
+    remaining = max(0, limit - user_data["used"])
+    
+    return {
+        "tier": user_data["tier"],
+        "used": user_data["used"],
+        "limit": limit,
+        "remaining": remaining
+    }
+
+def consume_tokens(user_id: str, action: str):
+    data = load_quotas()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
+    if user_id not in data:
+        data[user_id] = {
+            "tier": "Free",
+            "date": today,
+            "used": 0
+        }
+        
+    user_data = data[user_id]
+    if user_data.get("date") != today:
+        user_data["date"] = today
+        user_data["used"] = 0
+        
+    cost = TOKEN_COSTS.get(action, 1)
+    limit = TIERS.get(user_data["tier"], TIERS["Free"])["limit"]
+    
+    if user_data["used"] + cost > limit:
+        return {"error": "Quota exceeded. Upgrade your plan."}
+        
+    user_data["used"] += cost
+    save_quotas(data)
+    
+    remaining = max(0, limit - user_data["used"])
+    return {
+        "tier": user_data["tier"],
+        "used": user_data["used"],
+        "limit": limit,
+        "remaining": remaining
+    }
+
+@app.post("/set_tier")
+async def set_tier(user_id: str = Form(...), tier: str = Form(...)):
+    """Admin endpoint to upgrade a user"""
+    if tier not in TIERS:
+        raise HTTPException(status_code=400, detail="Invalid tier")
+        
+    data = load_quotas()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
+    if user_id not in data:
+        data[user_id] = {"used": 0, "date": today}
+        
+    data[user_id]["tier"] = tier
+    save_quotas(data)
+    return {"status": "success", "user_id": user_id, "tier": tier}
 
 @app.get("/quota/{user_id}")
-def get_quota(user_id: str):
-    """Returns the user's current quota status"""
+async def check_quota(user_id: str):
     return get_user_quota(user_id)
 
 
-# ── UPGRADE REQUEST ENDPOINT ─────────────────────────────────
-@app.post("/upgrade-request")
-def submit_upgrade_request(req: UpgradeRequest):
-    """Stores a pending upgrade request (manual UPI verification)"""
-    valid_plans = ["starter", "pro", "ultra", "ultimate"]
-    if req.plan not in valid_plans:
-        raise HTTPException(status_code=400, detail=f"Invalid plan. Choose from: {valid_plans}")
-    
-    expected_price = TIERS[req.plan]["price"]
-    if req.amount != expected_price:
-        raise HTTPException(status_code=400, detail=f"Amount mismatch. Expected {expected_price} for {req.plan} plan.")
-    
-    upgrades = _load_upgrades()
-    upgrades.append({
-        "user_id": req.user_id,
-        "plan": req.plan,
-        "amount": req.amount,
-        "utr": req.utr,
-        "status": "pending",
-        "requested_at": datetime.now(timezone.utc).isoformat(),
-    })
-    _save_upgrades(upgrades)
-    return {"status": "ok", "message": f"Upgrade request for {req.plan} plan submitted successfully."}
-
-
-@app.get("/upgrade-requests")
-def list_upgrade_requests():
-    """Admin endpoint to view all pending upgrade requests"""
-    return {"requests": _load_upgrades()}
-
-
-@app.post("/approve-upgrade/{user_id}/{plan}")
-def approve_upgrade(user_id: str, plan: str):
-    """Admin endpoint to approve an upgrade and change user tier"""
-    if plan not in TIERS:
-        raise HTTPException(status_code=400, detail="Invalid plan")
-    
-    data = _load_quota()
-    if user_id not in data:
-        data[user_id] = {"tier": plan, "date": _today(), "used": 0}
-    else:
-        data[user_id]["tier"] = plan
-    _save_quota(data)
-    
-    # Mark request as approved
-    upgrades = _load_upgrades()
-    for u in upgrades:
-        if u["user_id"] == user_id and u["plan"] == plan and u["status"] == "pending":
-            u["status"] = "approved"
-            u["approved_at"] = datetime.now(timezone.utc).isoformat()
-            break
-    _save_upgrades(upgrades)
-    
-    return {"status": "ok", "message": f"User {user_id} upgraded to {plan}", "quota": get_user_quota(user_id)}
-
-
-# ── SMART ROUTER ─────────────────────────────────────────────
-async def route_prompt(prompt: str, api_key: str) -> str:
-    """Uses a fast model to intelligently route the user's prompt to the best AI."""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "HTTP-Referer": "https://ekyra.app", 
-        "X-Title": "Ekyra AI Routing",
-        "Content-Type": "application/json"
-    }
-    
-    system_instruction = (
-        "You are an intelligent routing agent. Analyze the user's prompt and determine which AI model is best suited to handle it, based on these exact rules:\n"
-        "- CLAUDE: Use for coding tasks, writing essays, writing letters, deep reading, or improving text.\n"
-        "- GEMINI: Use for 'how-to' questions, learning tasks, explanations about how to do things, or questions related to Google Workspace (email, Gmail, PowerPoint, etc).\n"
-        "- GROK: Use for questions about real-time news, current events, or Twitter/X.\n"
-        "- GPT: Use for simple explanations ('explain this to me'), basic general knowledge, casual chat, or if the prompt doesn't clearly fit the others.\n\n"
-        "Output ONLY ONE WORD from this list: CLAUDE, GEMINI, GROK, GPT"
-    )
-    
-    payload = {
-        "model": "openai/gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.0,
-        "max_tokens": 5
-    }
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
-            res.raise_for_status()
-            data = res.json()
-            decision = data["choices"][0]["message"]["content"].strip().upper()
-            
-            if "CLAUDE" in decision: return "Claude"
-            if "GEMINI" in decision: return "Gemini"
-            if "GROK" in decision: return "Grok"
-            return "ChatGPT"
-    except Exception as e:
-        print(f"Router error: {e}")
-        return "ChatGPT"
-
-
-# ── WEB SEARCH TOOL ──────────────────────────────────────────
-def perform_web_search(query: str) -> str:
-    try:
-        req = urllib.request.Request(
-            'https://lite.duckduckgo.com/lite/',
-            data=urllib.parse.urlencode({'q': query}).encode('utf-8'),
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        )
-        res = urllib.request.urlopen(req).read()
-        tree = html.fromstring(res)
-        snippets = []
-        for snippet in tree.xpath("//td[@class='result-snippet']")[:5]:
-            snippets.append(snippet.text_content().strip())
-        if not snippets:
-            return "No search results found."
-        return "Search Results:\n" + "\n".join(f"- {s}" for s in snippets)
-    except Exception as e:
-        return f"Search failed: {str(e)}"
-
-# ── CHAT ENDPOINT ────────────────────────────────────────────
+# ── MAIN CHAT ENDPOINT ───────────────────────────────────────
 @app.post("/chat")
 async def chat(req: ChatRequest):
     if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "your_openrouter_api_key_here":
@@ -345,149 +189,84 @@ async def chat(req: ChatRequest):
     # ── CHECK QUOTA ──
     token_result = consume_tokens(req.user_id, "chat")
     if "error" in token_result:
-        return token_result  # Returns quota_exceeded message
+        return token_result
 
-    # Match the requested model
-    if req.model == "Auto ✨" or req.model == "Auto":
-        last_message = req.message if req.message else (req.history[-1].content if req.history else "")
-        matched_key = await route_prompt(last_message, OPENROUTER_API_KEY)
-        actual_model = MODEL_MAP[matched_key]
-        display_key = f"{matched_key} (Auto-Routed)"
-    else:
-        matched_key = next((k for k in MODEL_MAP.keys() if k in req.model), "ChatGPT")
-        actual_model = MODEL_MAP[matched_key]
-        display_key = matched_key
-
+    # Format history for OpenRouter
     messages = []
-    messages.append({
-        "role": "system",
-        "content": (
-            "You are Ekyra AI, a highly intelligent and professional AI assistant. "
-            "You have access to these tools:\n"
-            "1. web_search — Use this if the user asks about recent news, current events, or facts outside your training data.\n"
-            "2. generate_image — Use this if the user asks you to generate, create, draw, make, or show them ANY image, picture, photo, illustration, or diagram on ANY topic. "
-            "Extract the best possible image prompt from their request and call the tool.\n\n"
-            "IMPORTANT: Always remember the full conversation context. If you are switched to a different AI model mid-conversation, "
-            "read the entire chat history first and continue naturally from where the conversation left off.\n"
-            "Provide helpful, concise, and accurate answers. Format your output using markdown."
-        )
-    })
-    
     for msg in req.history:
-        messages.append({"role": msg.role, "content": msg.content})
+        messages.append({
+            "role": msg.get("role", "user"),
+            "content": msg.get("content", "")
+        })
+        
+    messages.append({"role": "user", "content": req.message})
 
-    if req.message:
-        messages.append({"role": "user", "content": req.message})
+    # Model Routing
+    actual_model = MODEL_MAP.get(req.model, MODEL_MAP["ChatGPT"])
+    display_key = req.model
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "HTTP-Referer": "https://ekyra.app", 
-        "X-Title": "Ekyra AI",
-        "Content-Type": "application/json"
-    }
-
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the live internet for up-to-date information, news, current events, or facts you do not know.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query to look up on DuckDuckGo"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "generate_image",
-                "description": "Generate an image based on a text description. Use this when the user asks to generate, create, draw, make, or show any image, picture, photo, illustration, or diagram.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "prompt": {
-                            "type": "string",
-                            "description": "A detailed description of the image to generate. Be specific and descriptive."
-                        }
-                    },
-                    "required": ["prompt"]
-                }
-            }
-        }
-    ]
-
+    # The payload configures the request
     payload = {
         "model": actual_model,
         "messages": messages,
-        "tools": tools
+        # Allow the model to call the image generation tool if it detects the user wants an image
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "generate_image",
+                    "description": "Generate an image based on a text prompt. Call this ONLY if the user explicitly asks to generate, draw, or create a picture/image.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": "A highly detailed visual description of the image to generate."
+                            }
+                        },
+                        "required": ["prompt"]
+                    }
+                }
+            }
+        ]
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://ekyra.app",
+        "X-Title": "Ekyra AI",
     }
 
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            response = await client.post(
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            res = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
                 json=payload
             )
-            response.raise_for_status()
-            data = response.json()
+            res.raise_for_status()
+            data = res.json()
             
             message_obj = data["choices"][0]["message"]
             
-            # Check if model wants to call a tool
-            if "tool_calls" in message_obj and message_obj["tool_calls"]:
+            # Check if the AI decided to call the image generation tool
+            if message_obj.get("tool_calls"):
                 tool_call = message_obj["tool_calls"][0]
-                tool_name = tool_call["function"]["name"]
-                args = json.loads(tool_call["function"]["arguments"])
-                
-                if tool_name == "web_search":
-                    search_results = perform_web_search(args["query"])
-                    
-                    messages.append(message_obj)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": search_results
-                    })
-                    
-                    payload["messages"] = messages
-                    payload.pop("tools", None)
-                    
-                    res2 = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers=headers,
-                        json=payload
-                    )
-                    res2.raise_for_status()
-                    data2 = res2.json()
-                    ai_text = data2["choices"][0]["message"]["content"]
-                    
-                    return {
-                        "response": ai_text,
-                        "model_used": display_key,
-                        "reason": f"Searched web for: {args['query']}",
-                        "quota": get_user_quota(req.user_id),
-                    }
-                
-                elif tool_name == "generate_image":
-                    import urllib.parse
+                if tool_call["function"]["name"] == "generate_image":
+                    args = json.loads(tool_call["function"]["arguments"])
                     image_prompt = args.get("prompt", req.message)
-                    safe_prompt = urllib.parse.quote(image_prompt)
-                    image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?nologo=true&enhance=true"
                     
-                    # Tell the AI the image was generated, let it write a nice response
+                    import urllib.parse
+                    safe_prompt = urllib.parse.quote(image_prompt)
+                    image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?model=flux&nologo=true&enhance=true&width=1024&height=1024"
+                    
+                    # Feed the generated image URL back to the AI so it can describe it
                     messages.append(message_obj)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
-                        "content": f"Image generated successfully. The image URL is: {image_url}"
+                        "name": "generate_image",
+                        "content": f"Image generated successfully. URL: {image_url}"
                     })
                     
                     payload["messages"] = messages
@@ -562,14 +341,33 @@ async def analyze_file(
             }
         ]
     else:
+        text_content = ""
+        filename_lower = file.filename.lower() if file.filename else ""
+        
         try:
-            text_content = content.decode('utf-8')
+            if filename_lower.endswith(".pdf"):
+                if PdfReader is None:
+                    raise Exception("PDF parsing library not installed on backend.")
+                pdf = PdfReader(io.BytesIO(content))
+                text_content = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
+            elif filename_lower.endswith(".docx"):
+                if docx is None:
+                    raise Exception("Word DOCX parsing library not installed on backend.")
+                doc = docx.Document(io.BytesIO(content))
+                text_content = "\n".join([p.text for p in doc.paragraphs])
+            else:
+                text_content = content.decode('utf-8')
+                
+            # Limit text content to roughly 50,000 characters to prevent API limits
+            if len(text_content) > 50000:
+                text_content = text_content[:50000] + "\n...[TRUNCATED DUE TO LENGTH]..."
+                
             messages = [
                 {"role": "system", "content": "Analyze the following file contents."},
                 {"role": "user", "content": f"File Name: {file.filename}\n\nContents:\n{text_content}\n\nPrompt: {prompt}"}
             ]
-        except Exception:
-            raise HTTPException(status_code=400, detail="Only images and text files are supported for analysis currently.")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read document: {str(e)}. Ensure it is a valid text, PDF, or DOCX file.")
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -654,3 +452,10 @@ async def generate_image(req: ImageGenRequest):
         "image_url": image_url,
         "source": "Pollinations AI (Flux)"
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    # When deployed on Render or Railway, it uses the PORT environment variable.
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
