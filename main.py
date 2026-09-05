@@ -46,10 +46,12 @@ MODEL_MAP = {
 }
 
 app = FastAPI(title="Ekyra AI Backend")
+
 @app.get("/")
 async def keep_awake():
     """Health check endpoint for cron jobs to ping"""
     return {"status": "awake", "message": "Ekyra AI Backend is running!"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -328,9 +330,18 @@ async def analyze_file(
 
     content = await file.read()
     actual_model = MODEL_MAP["ChatGPT"]
-    mime_type = file.content_type
     
-    if mime_type and mime_type.startswith("image/"):
+    # Safely identify if it's an image
+    mime_type = file.content_type or ""
+    filename_lower = file.filename.lower() if file.filename else ""
+    is_image = mime_type.startswith("image/") or filename_lower.endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp'))
+    
+    if is_image:
+        if not mime_type.startswith("image/"):
+            ext = filename_lower.split('.')[-1]
+            if ext == 'jpg': ext = 'jpeg'
+            mime_type = f"image/{ext}"
+            
         b64_image = base64.b64encode(content).decode('utf-8')
         image_url = f"data:{mime_type};base64,{b64_image}"
         
@@ -345,7 +356,6 @@ async def analyze_file(
         ]
     else:
         text_content = ""
-        filename_lower = file.filename.lower() if file.filename else ""
         
         try:
             if filename_lower.endswith(".pdf"):
